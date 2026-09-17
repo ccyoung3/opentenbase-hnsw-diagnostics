@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="490" viewBox="0 0 1100 490" role="img" aria-labelledby="title desc">
+  <title id="title">HNSW construction observability in OpenTenBase</title>
+  <desc id="desc">The pgvector extension records progress, spill context and internal wall time across serial and parallel HNSW builds. Build experiments combine these observations with container memory samples to produce diagnostics and parameter comparisons.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#526575"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #172b3a; }
+      .heading { font-size: 21px; font-weight: 700; }
+      .label { font-size: 18px; font-weight: 600; }
+      .detail { font-size: 16px; fill: #526575; }
+      .code { font-family: Consolas, monospace; font-size: 15px; fill: #526575; }
+      .arrow { fill: none; stroke: #526575; stroke-width: 1.7; marker-end: url(#arrow); }
+      .signal { fill: none; stroke: #8395a3; stroke-width: 1.6; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1100" height="490" fill="white"/>
+  <rect x="22" y="18" width="1056" height="212" rx="8" fill="#f7f9fb" stroke="#d5dfe7"/>
+  <text x="44" y="53" class="heading">OpenTenBase / pgvector HNSW build</text>
+  <text x="1056" y="52" text-anchor="end" class="detail">Serial and parallel construction</text>
+
+  <rect x="48" y="88" width="212" height="72" rx="5" fill="#edf5fb" stroke="#0072b2"/>
+  <text x="154" y="118" text-anchor="middle" class="label">In-memory graph</text>
+  <text x="154" y="143" text-anchor="middle" class="code">memory_build</text>
+  <path d="M260 124 H313" class="arrow"/>
+  <rect x="316" y="88" width="212" height="72" rx="5" fill="#fff7e6" stroke="#cf9300"/>
+  <text x="422" y="118" text-anchor="middle" class="label">Materialize pages</text>
+  <text x="422" y="143" text-anchor="middle" class="code">flush</text>
+  <path d="M528 124 H581" class="arrow"/>
+  <text x="555" y="111" text-anchor="middle" class="detail">spill</text>
+  <rect x="584" y="88" width="212" height="72" rx="5" fill="#fff1e9" stroke="#d55e00"/>
+  <text x="690" y="118" text-anchor="middle" class="label">On-disk insertion</text>
+  <text x="690" y="143" text-anchor="middle" class="code">disk_insert</text>
+  <path d="M796 124 H849" class="arrow"/>
+  <rect x="852" y="88" width="202" height="72" rx="5" fill="white" stroke="#9aa5b1"/>
+  <text x="953" y="118" text-anchor="middle" class="label">Write index WAL</text>
+  <text x="953" y="143" text-anchor="middle" class="code">wal</text>
+  <path d="M422 160 V183 H953 V163" class="arrow" stroke-dasharray="5 4"/>
+  <rect x="614" y="170" width="145" height="23" fill="#f7f9fb"/>
+  <text x="687" y="187" text-anchor="middle" class="detail">without spill</text>
+  <text x="44" y="214" class="detail">Key stages shown · Shared phase coordination · Eight internal timing intervals</text>
+
+  <path d="M201 230 V275" class="signal"/>
+  <path d="M550 230 V275" class="signal"/>
+  <path d="M899 230 V275" class="signal"/>
+  <rect x="46" y="278" width="310" height="78" rx="5" fill="white" stroke="#b7c3cc"/>
+  <text x="201" y="308" text-anchor="middle" class="label">SQL progress view</text>
+  <text x="201" y="334" text-anchor="middle" class="detail">Current phase and tuple progress</text>
+  <rect x="395" y="278" width="310" height="78" rx="5" fill="white" stroke="#b7c3cc"/>
+  <text x="550" y="308" text-anchor="middle" class="label">Build-connection logs</text>
+  <text x="550" y="334" text-anchor="middle" class="detail">Internal wall time and spill context</text>
+  <rect x="744" y="278" width="310" height="78" rx="5" fill="white" stroke="#b7c3cc"/>
+  <text x="899" y="308" text-anchor="middle" class="label">Container counters</text>
+  <text x="899" y="334" text-anchor="middle" class="detail">Sampled memory use</text>
+  <path d="M201 356 V393 H460 V416" class="signal"/>
+  <path d="M550 356 V416" class="signal"/>
+  <path d="M899 356 V393 H640 V416" class="signal"/>
+  <rect x="295" y="420" width="510" height="50" rx="5" fill="#edf5fb" stroke="#0072b2"/>
+  <text x="550" y="451" text-anchor="middle" class="label">Build diagnosis and parameter comparison</text>
+</svg>

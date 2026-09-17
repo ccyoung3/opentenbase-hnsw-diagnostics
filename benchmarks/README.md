@@ -104,3 +104,14 @@ python3 benchmarks/hnsw_build/audit_crossover.py \
 历史记录解压到 `benchmarks/results/records/`，可以与已运行的示例并存。若该子目录已存在，脚本拒绝覆盖；可用 `--destination <新目录>` 指定其他位置，再将 `--run` 指向其中的实验目录。
 
 离线复算不需要 Docker、数据集或 Python 实验依赖。成功时输出 `audit_status: verified`，表示原始记录、执行顺序和统计结果一致；性能结论在 `status` 与 `analysis` 中单独给出。附件包含原始测量、完整报告、实验配置和历史脚本。
+
+### 重绘文档中的实验图
+
+解压上述记录包后，在 Python 虚拟环境中安装绘图依赖并运行：
+
+```bash
+python3 -m pip install matplotlib==3.11.2
+python3 scripts/plot_figures.py
+```
+
+脚本读取正式内存对照与独立查询验证记录，生成 `docs/figures/glove-memory.svg` 和 `docs/figures/glove-recall.svg`。记录位于其他位置时使用 `--records <解压目录>`；`--output <目录>` 可指定图片输出位置。构建观测示意图的可编辑源文件为 `docs/figures/hnsw-observability.svg`。
