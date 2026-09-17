@@ -1,0 +1,10 @@
+*
+!OpenTenBase/
+!OpenTenBase/**
+!pgvector/
+!pgvector/**
+!scripts/
+!scripts/docker-entrypoint.sh
+**/.git
+**/.git/**
+**/.DS_Store

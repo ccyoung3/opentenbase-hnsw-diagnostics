@@ -1,0 +1,22 @@
+services:
+  db:
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_JOBS: "6"
+    image: ${HNSW_IMAGE:-opentenbase-pg18-pgvector:dev-arm64}
+    shm_size: 2gb
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - opentenbase_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  opentenbase_pgdata:

@@ -1,0 +1,645 @@
+diff --git a/src/hnsw.c b/src/hnsw.c
+index a3f5822..cb8e35d 100644
+--- a/src/hnsw.c
++++ b/src/hnsw.c
+@@ -37,6 +37,7 @@ int			hnsw_iterative_scan;
+ int			hnsw_max_scan_tuples;
+ double		hnsw_scan_mem_multiplier;
+ int			hnsw_lock_tranche_id;
++bool		hnsw_build_timing;
+ static relopt_kind hnsw_relopt_kind;
+ 
+ /*
+@@ -108,6 +109,10 @@ HnswInit(void)
+ 							 NULL, &hnsw_scan_mem_multiplier,
+ 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+ 
++	DefineCustomBoolVariable("hnsw.build_timing", "Reports HNSW internal build wall-clock timings",
++							 NULL, &hnsw_build_timing,
++							 false, PGC_USERSET, 0, NULL, NULL, NULL);
++
+ 	MarkGUCPrefixReserved("hnsw");
+ }
+ 
+@@ -121,8 +126,14 @@ hnswbuildphasename(int64 phasenum)
+ 	{
+ 		case PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE:
+ 			return "initializing";
+-		case PROGRESS_HNSW_PHASE_LOAD:
+-			return "loading tuples";
++		case PROGRESS_HNSW_PHASE_LOAD_MEMORY:
++			return "loading tuples in memory";
++		case PROGRESS_HNSW_PHASE_FLUSH:
++			return "flushing in-memory graph";
++		case PROGRESS_HNSW_PHASE_LOAD_DISK:
++			return "loading tuples on disk";
++		case PROGRESS_HNSW_PHASE_WAL:
++			return "writing index pages to WAL";
+ 		default:
+ 			return NULL;
+ 	}
+diff --git a/src/hnsw.h b/src/hnsw.h
+index 1f25cc2..b08494f 100644
+--- a/src/hnsw.h
++++ b/src/hnsw.h
+@@ -10,6 +10,7 @@
+ #include "lib/pairingheap.h"
+ #include "nodes/execnodes.h"
+ #include "port.h"				/* for random() */
++#include "port/atomics.h"
+ #include "storage/bufpage.h"
+ #include "storage/condition_variable.h"
+ #include "storage/lwlock.h"
+@@ -22,9 +23,7 @@
+ #include "storage/shmem.h"		/* for add_size()/mul_size() in some versions */
+ #endif
+ 
+-#ifdef HNSW_BENCH
+ #include "portability/instr_time.h"
+-#endif
+ 
+ #if PG_VERSION_NUM >= 190000
+ typedef Pointer Item;
+@@ -73,7 +72,10 @@ typedef Pointer Item;
+ 
+ /* Build phases */
+ /* PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE is 1 */
+-#define PROGRESS_HNSW_PHASE_LOAD		2
++#define PROGRESS_HNSW_PHASE_LOAD_MEMORY	2
++#define PROGRESS_HNSW_PHASE_FLUSH		3
++#define PROGRESS_HNSW_PHASE_LOAD_DISK	4
++#define PROGRESS_HNSW_PHASE_WAL			5
+ 
+ #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
+ #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
+@@ -157,6 +159,7 @@ extern int	hnsw_iterative_scan;
+ extern int	hnsw_max_scan_tuples;
+ extern double hnsw_scan_mem_multiplier;
+ extern int	hnsw_lock_tranche_id;
++extern bool hnsw_build_timing;
+ 
+ typedef enum HnswIterativeScanMode
+ {
+@@ -229,6 +232,15 @@ typedef struct HnswOptions
+ 	int			efConstruction; /* size of dynamic candidate list */
+ }			HnswOptions;
+ 
++/* Shared boundaries, written once under the existing graph locks. */
++typedef struct HnswGraphTiming
++{
++	bool		enabled;
++	instr_time	spillRequested;
++	instr_time	flushStarted;
++	instr_time	flushFinished;
++}			HnswGraphTiming;
++
+ typedef struct HnswGraph
+ {
+ 	/* Graph state */
+@@ -249,6 +261,8 @@ typedef struct HnswGraph
+ 	/* Flushed state */
+ 	LWLock		flushLock;
+ 	bool		flushed;
++	pg_atomic_uint32 buildPhase;
++	HnswGraphTiming timing;
+ }			HnswGraph;
+ 
+ typedef struct HnswShared
+@@ -324,6 +338,12 @@ typedef struct HnswBuildState
+ 	/* Statistics */
+ 	double		indtuples;
+ 	double		reltuples;
++	uint32		reportedBuildPhase;
++	bool		reportBuildPhase;
++	/* Leader-private copy survives destruction of parallel DSM. */
++	HnswGraphTiming graphTiming;
++	instr_time	scanFinished;
++	int			timingWorkers;
+ 
+ 	/* Support functions */
+ 	HnswSupport support;
+diff --git a/src/hnswbuild.c b/src/hnswbuild.c
+index 4d6d6b1..dacf0cc 100644
+--- a/src/hnswbuild.c
++++ b/src/hnswbuild.c
+@@ -50,6 +50,7 @@
+ #include "catalog/pg_type_d.h"
+ #include "commands/progress.h"
+ #include "hnsw.h"
++#include "lib/stringinfo.h"
+ #include "miscadmin.h"
+ #include "nodes/execnodes.h"
+ #include "optimizer/optimizer.h"
+@@ -82,6 +83,53 @@
+ 
+ #define HNSW_MAX_GRAPH_MEMORY (SIZE_MAX / 2)
+ 
++/*
++ * Publish the current shared build phase from the leader backend. Parallel
++ * workers update the shared value and wake the leader instead of writing to
++ * their own backend progress slots, which are not exposed for this command.
++ */
++static void
++ReportBuildPhase(HnswBuildState * buildstate)
++{
++	uint32		phase;
++
++	if (IsParallelWorker())
++		return;
++
++	phase = pg_atomic_read_u32(&buildstate->graph->buildPhase);
++	if (phase == buildstate->reportedBuildPhase)
++		return;
++
++	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, phase);
++	buildstate->reportedBuildPhase = phase;
++}
++
++/*
++ * Advance the shared build phase monotonically. Only the process that changes
++ * the value needs to notify the leader.
++ */
++static void
++AdvanceBuildPhase(HnswBuildState * buildstate, uint32 newPhase)
++{
++	uint32		oldPhase = pg_atomic_read_u32(&buildstate->graph->buildPhase);
++	bool		changed = false;
++
++	while (oldPhase < newPhase)
++	{
++		if (pg_atomic_compare_exchange_u32(&buildstate->graph->buildPhase,
++										   &oldPhase, newPhase))
++		{
++			changed = true;
++			break;
++		}
++	}
++
++	if (changed && IsParallelWorker() && buildstate->hnswshared != NULL)
++		ConditionVariableSignal(&buildstate->hnswshared->workersdonecv);
++
++	ReportBuildPhase(buildstate);
++}
++
+ /*
+  * Create the metapage
+  */
+@@ -307,12 +355,18 @@ FlushPages(HnswBuildState * buildstate)
+ 	elog(INFO, "memory: %zu MB", buildstate->graph->memoryUsed / (1024 * 1024));
+ #endif
+ 
++	/* The exclusive flush owner records the body, not the preceding wait. */
++	if (buildstate->graph->timing.enabled)
++		INSTR_TIME_SET_CURRENT(buildstate->graph->timing.flushStarted);
++
+ 	CreateMetaPage(buildstate);
+ 	CreateGraphPages(buildstate);
+ 	WriteNeighborTuples(buildstate);
+ 
+ 	buildstate->graph->flushed = true;
+ 	MemoryContextReset(buildstate->graphCtx);
++	if (buildstate->graph->timing.enabled)
++		INSTR_TIME_SET_CURRENT(buildstate->graph->timing.flushFinished);
+ }
+ 
+ /*
+@@ -529,19 +583,28 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
+ 	 */
+ 	if (add_size(graph->memoryUsed, memoryMargin) >= graph->memoryTotal)
+ 	{
++		/* allocatorLock serializes the first request, even with many waiters. */
++		if (graph->timing.enabled && INSTR_TIME_IS_ZERO(graph->timing.spillRequested))
++			INSTR_TIME_SET_CURRENT(graph->timing.spillRequested);
++
+ 		LWLockRelease(&graph->allocatorLock);
+ 
+ 		LWLockRelease(flushLock);
++		AdvanceBuildPhase(buildstate, PROGRESS_HNSW_PHASE_FLUSH);
+ 		LWLockAcquire(flushLock, LW_EXCLUSIVE);
+ 
+ 		if (!graph->flushed)
+ 		{
+ 			ereport(NOTICE,
+ 					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+-					 errdetail("Building will take significantly more time."),
++					 errdetail("Graph memory used: %zu bytes; graph memory limit: %zu bytes; dimensions: %d; m: %d; ef_construction: %d. Building will take significantly more time.",
++							   graph->memoryUsed, graph->memoryTotal,
++							   buildstate->dimensions, buildstate->m,
++							   buildstate->efConstruction),
+ 					 errhint("Increase maintenance_work_mem to speed up builds.")));
+ 
+ 			FlushPages(buildstate);
++			AdvanceBuildPhase(buildstate, PROGRESS_HNSW_PHASE_LOAD_DISK);
+ 		}
+ 
+ 		LWLockRelease(flushLock);
+@@ -587,6 +650,9 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
+ 	HnswGraph  *graph = buildstate->graph;
+ 	MemoryContext oldCtx;
+ 
++	if (buildstate->reportBuildPhase)
++		ReportBuildPhase(buildstate);
++
+ 	/* Skip nulls */
+ 	if (isnull[0])
+ 		return;
+@@ -623,6 +689,11 @@ InitGraph(HnswGraph * graph, char *base, Size memoryTotal)
+ 	graph->memoryTotal = Min(memoryTotal, HNSW_MAX_GRAPH_MEMORY);
+ 	graph->flushed = false;
+ 	graph->indtuples = 0;
++	graph->timing.enabled = hnsw_build_timing;
++	INSTR_TIME_SET_ZERO(graph->timing.spillRequested);
++	INSTR_TIME_SET_ZERO(graph->timing.flushStarted);
++	INSTR_TIME_SET_ZERO(graph->timing.flushFinished);
++	pg_atomic_init_u32(&graph->buildPhase, PROGRESS_HNSW_PHASE_LOAD_MEMORY);
+ 	SpinLockInit(&graph->lock);
+ 	LWLockInitialize(&graph->entryLock, hnsw_lock_tranche_id);
+ 	LWLockInitialize(&graph->entryWaitLock, hnsw_lock_tranche_id);
+@@ -717,6 +788,8 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
+ 
+ 	buildstate->reltuples = 0;
+ 	buildstate->indtuples = 0;
++	buildstate->reportedBuildPhase = 0;
++	buildstate->reportBuildPhase = false;
+ 
+ 	/* Get support functions */
+ 	HnswInitSupport(&buildstate->support, index);
+@@ -764,13 +837,14 @@ ParallelHeapScan(HnswBuildState * buildstate)
+ 	double		reltuples;
+ 
+ 	nparticipanttuplesorts = buildstate->hnswleader->nparticipanttuplesorts;
++	buildstate->graph = &hnswshared->graphData;
++	buildstate->hnswarea = buildstate->hnswleader->hnswarea;
+ 	for (;;)
+ 	{
++		ReportBuildPhase(buildstate);
+ 		SpinLockAcquire(&hnswshared->mutex);
+ 		if (hnswshared->nparticipantsdone == nparticipanttuplesorts)
+ 		{
+-			buildstate->graph = &hnswshared->graphData;
+-			buildstate->hnswarea = buildstate->hnswleader->hnswarea;
+ 			reltuples = hnswshared->reltuples;
+ 			SpinLockRelease(&hnswshared->mutex);
+ 			break;
+@@ -802,7 +876,9 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
+ 	indexInfo->ii_Concurrent = hnswshared->isconcurrent;
+ 	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
+ 	buildstate.graph = &hnswshared->graphData;
++	buildstate.hnswshared = hnswshared;
+ 	buildstate.hnswarea = hnswarea;
++	buildstate.reportBuildPhase = progress;
+ 	InitAllocator(&buildstate.allocator, &HnswSharedMemoryAlloc, &buildstate);
+ 	scan = table_beginscan_parallel(heapRel,
+ 									ParallelTableScanFromHnswShared(hnswshared)
+@@ -1008,6 +1084,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+ 
+ 	hnswarea = (char *) shm_toc_allocate(pcxt->toc, esthnswarea);
+ 	InitGraph(&hnswshared->graphData, hnswarea, esthnswarea);
++	hnswshared->graphData.timing.enabled = buildstate->graph->timing.enabled;
+ 
+ 	/*
+ 	 * Avoid base address for relptr for Postgres < 14.5
+@@ -1090,7 +1167,7 @@ BuildGraph(HnswBuildState * buildstate)
+ {
+ 	int			parallel_workers = 0;
+ 
+-	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
++	ReportBuildPhase(buildstate);
+ 
+ 	/* Calculate parallel workers */
+ 	if (buildstate->heap != NULL)
+@@ -1112,15 +1189,80 @@ BuildGraph(HnswBuildState * buildstate)
+ 		buildstate->indtuples = buildstate->graph->indtuples;
+ 	}
+ 
++	if (buildstate->graph->timing.enabled)
++		INSTR_TIME_SET_CURRENT(buildstate->scanFinished);
++
+ 	/* Flush pages */
+ 	if (!buildstate->graph->flushed)
++	{
++		AdvanceBuildPhase(buildstate, PROGRESS_HNSW_PHASE_FLUSH);
+ 		FlushPages(buildstate);
++	}
++
++	/* All scans are done. Copy shared boundaries before destroying DSM. */
++	buildstate->graphTiming = buildstate->graph->timing;
++	buildstate->timingWorkers = buildstate->hnswleader ?
++		buildstate->hnswleader->pcxt->nworkers_launched : 0;
+ 
+ 	/* End parallel build */
+ 	if (buildstate->hnswleader)
+ 		HnswEndParallel(buildstate->hnswleader);
+ }
+ 
++/* Offsets share one origin; subtracting them gives a nonduplicated timeline. */
++static int64
++BuildTimeOffset(instr_time boundary, instr_time origin)
++{
++	INSTR_TIME_SUBTRACT(boundary, origin);
++	return (int64) INSTR_TIME_GET_MICROSEC(boundary);
++}
++
++static void
++AppendBuildPhase(StringInfo buf, const char *phase, int64 start, int64 end, bool applicable)
++{
++	appendStringInfo(buf, ",{\"phase\":\"%s\",\"start_us\":", phase);
++	if (applicable)
++		appendStringInfo(buf, INT64_FORMAT ",\"end_us\":" INT64_FORMAT "}", start, end);
++	else
++		appendStringInfoString(buf, "null,\"end_us\":null}");
++}
++
++/* Only the leader reports a successful AM call, not command/commit success. */
++static void
++ReportBuildTiming(HnswBuildState *buildstate, instr_time start, instr_time graphStart,
++				  instr_time walStart, instr_time walEnd, instr_time finished, bool needsWal)
++{
++	HnswGraphTiming *timing = &buildstate->graphTiming;
++	bool		spill = !INSTR_TIME_IS_ZERO(timing->spillRequested);
++	int64		setupEnd = BuildTimeOffset(graphStart, start);
++	int64		flushStart = BuildTimeOffset(timing->flushStarted, start);
++	int64		flushEnd = BuildTimeOffset(timing->flushFinished, start);
++	int64		memoryEnd = spill ? BuildTimeOffset(timing->spillRequested, start) : flushStart;
++	int64		graphEnd = spill ? BuildTimeOffset(buildstate->scanFinished, start) : flushEnd;
++	int64		walStartUs = BuildTimeOffset(walStart, start);
++	int64		walEndUs = BuildTimeOffset(walEnd, start);
++	int64		total = BuildTimeOffset(finished, start);
++	StringInfoData buf;
++
++	initStringInfo(&buf);
++	appendStringInfo(&buf, "{\"version\":1,\"status\":\"complete\",\"scope\":\"hnsw_build\","
++					 "\"clock\":\"elapsed_wall\",\"pid\":%d,\"index_oid\":%u,\"fork\":%d,"
++					 "\"parallel_workers\":%d,\"spill\":%s,\"total_us\":" INT64_FORMAT ","
++					 "\"phases\":[{\"phase\":\"setup\",\"start_us\":0,\"end_us\":" INT64_FORMAT "}",
++					 MyProcPid, RelationGetRelid(buildstate->index), buildstate->forkNum,
++					 buildstate->timingWorkers, spill ? "true" : "false", total, setupEnd);
++	AppendBuildPhase(&buf, "memory_build", setupEnd, memoryEnd, true);
++	AppendBuildPhase(&buf, "spill_drain", memoryEnd, flushStart, spill);
++	AppendBuildPhase(&buf, "flush", flushStart, flushEnd, true);
++	AppendBuildPhase(&buf, "disk_insert", flushEnd, graphEnd, spill);
++	AppendBuildPhase(&buf, "finalize", graphEnd, walStartUs, true);
++	AppendBuildPhase(&buf, "wal", walStartUs, walEndUs, needsWal);
++	AppendBuildPhase(&buf, "cleanup", walEndUs, total, true);
++	appendStringInfoString(&buf, "]}");
++	ereport(NOTICE, (errmsg_internal("hnsw build timing: %s", buf.data)));
++	pfree(buf.data);
++}
++
+ /*
+  * Build the index
+  */
+@@ -1128,18 +1270,50 @@ static void
+ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
+ 		   HnswBuildState * buildstate, ForkNumber forkNum)
+ {
++	bool		timingEnabled = hnsw_build_timing;
++	bool		needsWal;
++	instr_time	start;
++	instr_time	graphStart;
++	instr_time	walStart;
++	instr_time	walEnd;
++	instr_time	finished;
++
++	if (timingEnabled)
++		INSTR_TIME_SET_CURRENT(start);
+ #ifdef HNSW_MEMORY
+ 	SeedRandom(42);
+ #endif
+ 
+ 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
++	buildstate->graph->timing.enabled = timingEnabled;
++	if (timingEnabled)
++		INSTR_TIME_SET_CURRENT(graphStart);
+ 
+ 	BuildGraph(buildstate);
+ 
+-	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
++	needsWal = RelationNeedsWAL(index) || forkNum == INIT_FORKNUM;
++	if (timingEnabled)
++		INSTR_TIME_SET_CURRENT(walStart);
++	if (needsWal)
++	{
++		pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
++								 PROGRESS_HNSW_PHASE_WAL);
+ 		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
++	}
++	if (timingEnabled)
++	{
++		if (needsWal)
++			INSTR_TIME_SET_CURRENT(walEnd);
++		else
++			walEnd = walStart;
++	}
+ 
+ 	FreeBuildState(buildstate);
++	if (timingEnabled)
++	{
++		INSTR_TIME_SET_CURRENT(finished);
++		ReportBuildTiming(buildstate, start, graphStart, walStart, walEnd, finished, needsWal);
++	}
+ }
+ 
+ /*
+diff --git a/test/t/045_hnsw_low_memory_build.pl b/test/t/045_hnsw_low_memory_build.pl
+index 5a65736..c43d3f3 100644
+--- a/test/t/045_hnsw_low_memory_build.pl
++++ b/test/t/045_hnsw_low_memory_build.pl
+@@ -16,6 +16,17 @@ $node->safe_psql("postgres",
+ 	"INSERT INTO tst SELECT ARRAY[random(), random(), random()] FROM generate_series(1, 1000) i;"
+ );
+ 
++is(
++	$node->safe_psql("postgres", qq(
++		SELECT string_agg(pg_indexam_progress_phasename(oid, phase), ',' ORDER BY phase)
++		FROM pg_am
++		CROSS JOIN generate_series(2, 5) AS phase
++		WHERE amname = 'hnsw';
++	)),
++	"loading tuples in memory,flushing in-memory graph,loading tuples on disk,writing index pages to WAL",
++	"reports descriptive HNSW build phase names"
++);
++
+ my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
+ 	SET client_min_messages = DEBUG;
+ 	SET maintenance_work_mem = '3073kB';
+@@ -25,5 +36,9 @@ my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
+ is($ret, 0, $stderr);
+ like($stderr, qr/using \d+ parallel workers/);
+ like($stderr, qr/hnsw graph no longer fits into maintenance_work_mem after 0 tuples/);
++like(
++	$stderr,
++	qr/Graph memory used: \d+ bytes; graph memory limit: \d+ bytes; dimensions: 3; m: 16; ef_construction: 64\./
++);
+ 
+ done_testing();
+diff --git a/test/t/049_hnsw_build_timing.pl b/test/t/049_hnsw_build_timing.pl
+new file mode 100644
+index 0000000..36e4bf5
+--- /dev/null
++++ b/test/t/049_hnsw_build_timing.pl
+@@ -0,0 +1,164 @@
++use strict;
++use warnings FATAL => 'all';
++use PostgreSQL::Test::Cluster;
++use PostgreSQL::Test::Utils;
++use JSON::PP qw(decode_json);
++use Test::More;
++
++my $node = PostgreSQL::Test::Cluster->new('timing');
++$node->init;
++$node->append_conf('postgresql.conf', qq(
++max_parallel_workers = 4
++max_worker_processes = 8
++wal_level = replica
++));
++$node->start;
++$node->safe_psql('postgres', q(
++CREATE EXTENSION vector;
++CREATE TABLE tst (id int, v vector(8));
++SELECT setseed(0.42);
++INSERT INTO tst SELECT i, ARRAY[random(),random(),random(),random(),
++ random(),random(),random(),random()] FROM generate_series(1,5000) i;
++ANALYZE tst;
++));
++
++sub summaries
++{
++	my ($stderr) = @_;
++	return map { decode_json($_) } $stderr =~ /hnsw build timing: (\{[^\n]+\})/g;
++}
++
++sub check_timeline
++{
++	my ($record, $spill, $workers, $wal, $label) = @_;
++	is($record->{version}, 1, "$label: schema version");
++	is($record->{status}, 'complete', "$label: complete AM call");
++	is($record->{scope}, 'hnsw_build', "$label: internal scope");
++	is($record->{clock}, 'elapsed_wall', "$label: wall time, not worker sum");
++	is(!!$record->{spill}, !!$spill, "$label: spill applicability");
++	is($record->{parallel_workers}, $workers, "$label: actual launched workers");
++	my @names = qw(setup memory_build spill_drain flush disk_insert finalize wal cleanup);
++	is_deeply([map { $_->{phase} } @{$record->{phases}}], \@names,
++		"$label: exactly one of each phase, in order");
++	my $last = 0;
++	for my $phase (@{$record->{phases}})
++	{
++		my $name = $phase->{phase};
++		my $na = (!$spill && ($name eq 'spill_drain' || $name eq 'disk_insert'))
++			|| (!$wal && $name eq 'wal');
++		if ($na)
++		{
++			ok(!defined($phase->{start_us}) && !defined($phase->{end_us}), "$label: $name is N/A");
++			next;
++		}
++		is($phase->{start_us}, $last, "$label: $name has no gap or overlap");
++		cmp_ok($phase->{end_us}, '>=', $phase->{start_us}, "$label: $name monotonic");
++		$last = $phase->{end_us};
++	}
++	is($last, $record->{total_us}, "$label: phases cover total exactly");
++	cmp_ok($last, '>', 0, "$label: positive elapsed time");
++}
++
++my ($ret, $stdout, $stderr) = $node->psql('postgres', q(
++SET max_parallel_maintenance_workers = 0;
++CREATE INDEX default_idx ON tst USING hnsw (v vector_l2_ops);
++));
++is($ret, 0, 'default build succeeds');
++unlike($stderr, qr/hnsw build timing:/, 'timing defaults to off');
++
++for my $workers (0, 2)
++{
++	for my $spill (0, 1)
++	{
++		my $memory = $spill ? ($workers ? '4MB' : '1MB') : '64MB';
++		my $label = "workers=$workers spill=$spill";
++		($ret, $stdout, $stderr) = $node->psql('postgres', qq(
++SET client_min_messages = NOTICE;
++SET hnsw.build_timing = on;
++SET maintenance_work_mem = '$memory';
++SET max_parallel_maintenance_workers = $workers;
++SET min_parallel_table_scan_size = 0;
++ALTER TABLE tst SET (parallel_workers = $workers);
++CREATE INDEX timing_${workers}_${spill} ON tst USING hnsw (v vector_l2_ops);
++));
++		is($ret, 0, "$label: build succeeds") or diag($stderr);
++		my @records = summaries($stderr);
++		is(scalar @records, 1, "$label: leader emits exactly one summary");
++		check_timeline($records[0], $spill, $workers, 1, $label) if @records == 1;
++		if ($spill)
++		{
++			like($stderr, qr/graph no longer fits/, "$label: actual spill NOTICE");
++		}
++	}
++}
++
++# Unlogged main and init forks are different AM invocations. Main skips WAL.
++($ret, $stdout, $stderr) = $node->psql('postgres', q(
++SET hnsw.build_timing = on;
++CREATE UNLOGGED TABLE empty_tst (v vector(8));
++CREATE INDEX unlogged_idx ON empty_tst USING hnsw (v vector_l2_ops);
++));
++is($ret, 0, 'empty unlogged index succeeds');
++my @forks = summaries($stderr);
++is_deeply([map { $_->{fork} } @forks], [0, 3], 'main and init fork summaries are distinct');
++for my $record (@forks)
++{
++	check_timeline($record, 0, 0, $record->{fork} == 3, "fork=$record->{fork}");
++}
++
++# Slow expression lets the test cancel an actual build, without polling a
++# fleeting build phase. The same backend must then build successfully.
++$node->safe_psql('postgres', q(
++CREATE FUNCTION slow_vector(v vector) RETURNS vector
++LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
++BEGIN PERFORM pg_sleep(0.01); RETURN v; END $$;
++CREATE FUNCTION failing_vector(v vector) RETURNS vector
++LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
++BEGIN RAISE EXCEPTION 'timing test failure'; END $$;
++));
++for my $workers (0, 2)
++{
++	my $session = $node->background_psql('postgres', on_error_stop => 0);
++	$session->query_safe(qq(
++SET hnsw.build_timing = on;
++SET client_min_messages = NOTICE;
++SET max_parallel_maintenance_workers = $workers;
++SET min_parallel_table_scan_size = 0;
++ALTER TABLE tst SET (parallel_workers = $workers);
++));
++	my $pid = $session->query_safe('SELECT pg_backend_pid()');
++	$session->query_until(qr/starting/, qq(\n\\echo starting
++CREATE INDEX cancelled_$workers ON tst USING hnsw ((slow_vector(v)::vector(8)) vector_l2_ops);
++));
++	ok($node->poll_query_until('postgres',
++		"SELECT wait_event = 'PgSleep' FROM pg_stat_activity WHERE pid = $pid"),
++		"workers=$workers: entered slow build expression");
++	is($node->safe_psql('postgres', "SELECT pg_cancel_backend($pid)"), 't', 'cancel accepted');
++	$session->query('SELECT 1');
++	like($session->{stderr}, qr/canceling statement due to user request/, 'build cancelled');
++	unlike($session->{stderr}, qr/hnsw build timing:/, 'cancelled build emits no complete summary');
++	$session->{stderr} = '';
++	$session->query(qq(CREATE INDEX failed_$workers ON tst USING hnsw ((failing_vector(v)::vector(8)) vector_l2_ops)));
++	like($session->{stderr}, qr/timing test failure/, 'expression error exercised');
++	unlike($session->{stderr}, qr/hnsw build timing:/, 'failed build emits no complete summary');
++	$session->{stderr} = '';
++	$session->query(qq(CREATE INDEX recovered_$workers ON tst USING hnsw (v vector_l2_ops)));
++	my @recovered = summaries($session->{stderr});
++	is(scalar @recovered, 1, 'same backend recovers with a fresh single summary');
++	check_timeline($recovered[0], 0, $workers, 1, "recovered=$workers") if @recovered == 1;
++	$session->{stderr} = '';
++	$session->query(qq(REINDEX INDEX recovered_$workers));
++	my @repeated = summaries($session->{stderr});
++	is(scalar @repeated, 1, 'repeated build has exactly one fresh summary');
++	$session->{stderr} = '';
++	$session->query_safe('SET hnsw.build_timing = off');
++	$session->query(qq(REINDEX INDEX recovered_$workers));
++	unlike($session->{stderr}, qr/hnsw build timing:/, 'turning off suppresses summary');
++	$session->{stderr} = '';
++	is($session->query_safe("SELECT count(*) FROM pg_stat_progress_create_index WHERE pid = $pid"), 0,
++		'no stale build progress after recovery');
++	$session->quit;
++}
++
++$node->stop;
++done_testing();

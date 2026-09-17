@@ -1,0 +1,21 @@
+# Upstream checkouts and source preparation scratch files.
+/OpenTenBase/
+/pgvector/
+/.hnsw-sources-*/
+
+# Local dependencies, inputs and generated caches.
+/.venv*/
+/data/cache/
+/.cache/
+/tmp/
+/output/
+.DS_Store
+**/__pycache__/
+*.py[cod]
+
+# Expanded experimental records and new runs.
+/benchmarks/results/
+/benchmarks/.results-*/
+
+# Downloaded Release asset.
+/experiment-records.zip
